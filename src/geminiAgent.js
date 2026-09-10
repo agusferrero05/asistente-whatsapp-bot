@@ -85,7 +85,13 @@ Reglas operativas obligatorias:
      * tipo_pago: "efectivo", "debito" o "transferencia", según lo que diga (ej. "pagué en efectivo" → efectivo; "con la tarjeta", "débito" → debito; "transferí", "por transferencia" → transferencia).
      * medio_pago: el nombre de la cuenta/tarjeta virtual si lo menciona (ej. Naranja X, Uala, Mercado Pago, Brubank, Personal Pay, etc.), solo aplica cuando el pago es débito o transferencia.
      Si el usuario NO aclara el tipo de pago, NO se lo preguntes ni asumas nada vos: simplemente no incluyas tipo_pago ni medio_pago en la llamada — el sistema ya aplica el default (débito en Naranja X) automáticamente. Si dice "efectivo" y nada más, mandá solo tipo_pago: "efectivo" sin medio_pago.
+     Si el usuario aclara que el gasto fue en otro momento (no hoy) — "ayer", "anteayer", "el sábado pasado", "el 5 de septiembre", "hace 3 días", etc. — calculá la fecha real en formato YYYY-MM-DD usando la fecha de hoy que tenés arriba como referencia, y pasala en el parámetro fecha. Si no dice nada sobre cuándo fue, no incluyas fecha (se usa la de hoy automáticamente). Nunca calcules una fecha futura para un gasto.
    - Deshacer gastos erróneos: si el usuario pide anular, deshacer o borrar el último gasto, usá deshacer_ultimo_gasto.
+   - Consultar gastos: usá consultar_gastos para CUALQUIER pregunta sobre gastos pasados (cuánto, en qué, cuándo, con qué medio de pago, etc.). SIEMPRE se calcula en base a la fecha de HOY (la de este mensaje), nunca años anteriores salvo que el usuario los mencione.
+     * Si el usuario pide un período relativo — "último día", "últimos 3 días", "esta semana"/"última semana", "últimas 2 semanas", "último mes", "últimos 2 meses", etc. — pasá unidad ("dia", "semana" o "mes") y cantidad (el número; si dice "último/a X" sin número, cantidad es 1). La herramienta ya calcula el rango correcto contando hacia atrás desde hoy — vos solo interpretás cuántas unidades pidió.
+     * Si el usuario menciona un mes calendario por nombre ("en agosto", "en julio"), pasá mes en formato YYYY-MM en vez de unidad/cantidad.
+     * Si no da ninguna referencia temporal (pregunta genérica "¿cuánto gasté?"), no pases nada: usa el mes calendario actual por defecto.
+     La herramienta devuelve el rango de fechas usado (desde/hasta), el total, la cantidad de gastos, desgloses por categoría/tipo de pago/medio de pago, y detalle: la lista de cada gasto individual (fecha, monto, categoría, concepto, tipo_pago, medio_pago) encontrado en ese rango, ordenados del más viejo al más nuevo. Si preguntan "cuánto" respondé con el total (y el desglose puntual que corresponda, ej. por_tipo_pago.Efectivo si preguntan por efectivo); si preguntan "qué gasté" o piden el detalle, listá los ítems de detalle de forma breve para WhatsApp.
    - Deudas y Cobros: 'deuda' es lo que el usuario debe a otros; 'cobro' es lo que le deben al usuario. Para asentar usá registrar_deuda_cobro. Cuando se salde, usá saldar_cuenta.
 
 3. Anotador / Notas:
@@ -178,6 +184,11 @@ const toolDeclarations = [
           description:
             "Cuenta o tarjeta virtual usada (ej. 'Naranja X', 'Uala', 'Mercado Pago', 'Brubank'), SOLO si el usuario la menciona y el pago fue débito o transferencia. Si no la menciona, omitir este campo (el default es Naranja X).",
         },
+        fecha: {
+          type: "STRING",
+          description:
+            "Fecha real del gasto en formato YYYY-MM-DD, SOLO si el usuario aclara que fue en otro día (ej. 'ayer', 'el sábado pasado', 'el 5 de septiembre'). Calculala vos usando la fecha de hoy como referencia. Si no dice nada, omitir este campo (se usa hoy).",
+        },
       },
       required: ["monto", "categoria"],
     },
@@ -186,6 +197,32 @@ const toolDeclarations = [
     name: "deshacer_ultimo_gasto",
     description: "Elimina el último gasto registrado en Google Sheets.",
     parameters: { type: "OBJECT", properties: {} },
+  },
+  {
+    name: "consultar_gastos",
+    description:
+      "Busca en Google Sheets los gastos de un período y devuelve total, cantidad, desglose por categoría/tipo de pago/medio de pago, y el detalle (lista) de cada gasto individual encontrado. Usalo para responder cualquier pregunta sobre gastos pasados, sea 'cuánto' o 'qué' gastó.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        unidad: {
+          type: "STRING",
+          description:
+            "Para períodos relativos a HOY tipo 'último/os día(s)/semana(s)/mes(es)'. Usar junto con cantidad.",
+          enum: ["dia", "semana", "mes"],
+        },
+        cantidad: {
+          type: "NUMBER",
+          description:
+            "Cuántas unidades hacia atrás desde hoy (ej. 'último día' = 1, 'últimas 2 semanas' = 2). Requiere unidad. Si el usuario dice 'último/a' sin número, usar 1.",
+        },
+        mes: {
+          type: "STRING",
+          description:
+            "Mes calendario puntual en formato YYYY-MM, SOLO cuando el usuario nombra un mes específico (ej. 'en agosto'). No usar junto con unidad/cantidad.",
+        },
+      },
+    },
   },
   {
     name: "registrar_deuda_cobro",
@@ -263,6 +300,7 @@ const toolHandlers = {
   eliminar_evento: calendarTools.eliminarEvento,
   registrar_gasto: sheetsTools.registrarGasto,
   deshacer_ultimo_gasto: sheetsTools.deshacerUltimoGasto,
+  consultar_gastos: sheetsTools.consultarGastos,
   registrar_deuda_cobro: sheetsTools.registrarDeudaCobro,
   saldar_cuenta: sheetsTools.saldarCuenta,
   guardar_notas: sheetsTools.guardarNotas,

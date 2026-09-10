@@ -1,8 +1,10 @@
 import { google } from "googleapis";
+import { DateTime } from "luxon";
 import { getOAuthClient } from "./googleAuth.js";
 
 const sheets = google.sheets({ version: "v4", auth: getOAuthClient() });
 const SHEET_ID = process.env.GOOGLE_SHEET_ID;
+const TZ = process.env.TIMEZONE || "America/Argentina/Buenos_Aires";
 
 // Pestañas esperadas en tu Google Sheet. Headers en fila 1:
 // Gastos:  Fecha | Monto | Categoria | Concepto | Tipo de pago | Medio de pago
@@ -51,12 +53,48 @@ async function appendRow(hoja, values) {
   });
 }
 
+/** Normaliza el valor crudo de una celda "Fecha" a YYYY-MM-DD. Google Sheets
+ * reconoce el texto que escribimos como fecha real y la guarda como número
+ * de serie (mostrándola con el formato regional de la planilla, ej.
+ * DD/MM/YYYY) — eso está bien para que se vea prolijo, siempre que la
+ * LEAMOS con valueRenderOption "UNFORMATTED_VALUE" (ver getRowsConIndice) y
+ * la reconvirtamos acá a ISO para poder compararla. También soporta, por las
+ * dudas, texto ISO directo o texto ya en DD/MM/YYYY. Nunca rompe: si no
+ * reconoce el formato, devuelve el valor tal cual. */
+function fechaCeldaAISO(valor) {
+  if (valor === null || valor === undefined || valor === "") return "";
+
+  if (typeof valor === "number") {
+    // Serial de fecha de Sheets/Excel: días desde 1899-12-30.
+    const ms = Math.round((valor - 25569) * 86400 * 1000);
+    return new Date(ms).toISOString().slice(0, 10);
+  }
+
+  const str = String(valor).trim();
+  if (/^\d{4}-\d{2}-\d{2}/.test(str)) return str.slice(0, 10);
+
+  const match = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+  if (match) {
+    const [, d, m, y] = match;
+    return `${y}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
+  }
+
+  return str;
+}
+
 /** Trae todas las filas de una pestaña (sin headers) con su número de fila real (1-indexed, incluye header). */
 async function getRowsConIndice(hoja) {
   // A2:F cubre de sobra tanto Gastos (6 columnas, con tipo/medio de pago)
   // como las pestañas más angostas (Deudas/Cobros/Notas, 4 columnas) — las
   // columnas E y F simplemente vienen vacías/undefined para esas otras.
-  const { data } = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${hoja}!A2:F` });
+  // UNFORMATTED_VALUE evita que Sheets nos devuelva números/fechas ya
+  // formateados según el idioma de la planilla (rompía sumas y comparaciones
+  // de fecha) — devuelve el valor "crudo" (número real, o serial de fecha).
+  const { data } = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: `${hoja}!A2:F`,
+    valueRenderOption: "UNFORMATTED_VALUE",
+  });
   return (data.values || []).map((row, i) => ({ filaIndex: i + 2, row })); // +2: fila 1 es header, A2 es index 0
 }
 
@@ -90,15 +128,19 @@ async function actualizarCelda(hoja, filaIndex, columnaLetra, valor) {
 // GASTOS
 // ---------------------------------------------------------------------------
 
-export async function registrarGasto({ monto, categoria, concepto, tipo_pago, medio_pago }) {
-  const fecha = new Date().toISOString().slice(0, 10);
+export async function registrarGasto({ monto, categoria, concepto, tipo_pago, medio_pago, fecha } = {}) {
+  const hoyISO = DateTime.now().setZone(TZ).toISODate();
+  // Si el agente manda una fecha pasada (ej. "el sábado pasado"), la
+  // usamos — pero solo si es un YYYY-MM-DD válido y no es futura (para no
+  // cargar un gasto en una fecha que todavía no pasó por un error del agente).
+  const fechaFinal = /^\d{4}-\d{2}-\d{2}$/.test(fecha || "") && fecha <= hoyISO ? fecha : hoyISO;
 
   const tipoPagoNormalizado = TIPOS_PAGO_VALIDOS[(tipo_pago || "").trim().toLowerCase()] || TIPO_PAGO_DEFAULT;
   const esEfectivo = tipoPagoNormalizado === "Efectivo";
   const medioPagoFinal = esEfectivo ? "" : (medio_pago || "").trim() || MEDIO_PAGO_DEFAULT;
 
   await appendRow(HOJAS.gasto, [
-    fecha,
+    fechaFinal,
     monto,
     categoria || "sin categoría",
     concepto || "",
@@ -108,7 +150,7 @@ export async function registrarGasto({ monto, categoria, concepto, tipo_pago, me
 
   return {
     ok: true,
-    fecha,
+    fecha: fechaFinal,
     monto,
     categoria: categoria || "sin categoría",
     concepto: concepto || "",
@@ -125,7 +167,7 @@ export async function deshacerUltimoGasto() {
   const ultima = filas[filas.length - 1];
   await borrarFila(HOJAS.gasto, ultima.filaIndex);
   const [fecha, monto, categoria, concepto, tipo_pago, medio_pago] = ultima.row;
-  return { ok: true, eliminado: { fecha, monto, categoria, concepto, tipo_pago, medio_pago } };
+  return { ok: true, eliminado: { fecha: fechaCeldaAISO(fecha), monto, categoria, concepto, tipo_pago, medio_pago } };
 }
 
 // ---------------------------------------------------------------------------
@@ -200,10 +242,98 @@ export async function limpiarNotas({ categoria } = {}) {
   return { ok: true, cantidad: objetivo.length, categoria: categoria || "todas" };
 }
 
-/** Suma los gastos del mes dado (YYYY-MM), para resúmenes. */
-export async function totalGastosDelMes(mesISO) {
+/**
+ * Calcula el rango [desde, hasta] (YYYY-MM-DD, ambos inclusive) para un
+ * período relativo a HOY (según TZ), tipo "últimos N días/semanas/meses".
+ * "hasta" siempre es hoy. cantidad=1 significa el período más chico posible
+ * de esa unidad (ej. unidad=dia, cantidad=1 → solo hoy).
+ */
+function rangoRelativo(unidad, cantidad) {
+  const n = Math.max(1, Math.round(Number(cantidad) || 1));
+  const hoy = DateTime.now().setZone(TZ).startOf("day");
+
+  let inicio;
+  if (unidad === "dia") inicio = hoy.minus({ days: n - 1 });
+  else if (unidad === "semana") inicio = hoy.minus({ days: n * 7 - 1 });
+  else if (unidad === "mes") inicio = hoy.minus({ months: n }).plus({ days: 1 });
+  else inicio = hoy.startOf("month");
+
+  return { desde: inicio.toISODate(), hasta: hoy.toISODate() };
+}
+
+/**
+ * Consulta gastos en un período: relativo a hoy ("últimos N días/semanas/
+ * meses", vía unidad+cantidad) o un mes calendario puntual (vía mes,
+ * YYYY-MM). Sin parámetros, usa el mes calendario actual. Devuelve total,
+ * cantidad, desglose por categoría/tipo de pago/medio de pago, y el detalle
+ * (lista) de los gastos individuales encontrados en ese rango — pensado para
+ * que el agente conteste tanto "¿cuánto gasté...?" como "¿qué gasté...?".
+ */
+export async function consultarGastos({ unidad, cantidad, mes } = {}) {
+  let desde, hasta, periodo;
+
+  if (unidad) {
+    ({ desde, hasta } = rangoRelativo(unidad, cantidad));
+    const n = Math.max(1, Math.round(Number(cantidad) || 1));
+    periodo = `últimos ${n} ${unidad}(s)`;
+  } else if (mes) {
+    desde = `${mes}-01`;
+    hasta = DateTime.fromISO(`${mes}-01`, { zone: TZ }).endOf("month").toISODate();
+    periodo = mes;
+  } else {
+    const hoy = DateTime.now().setZone(TZ).startOf("day");
+    desde = hoy.startOf("month").toISODate();
+    hasta = hoy.toISODate();
+    periodo = hoy.toFormat("yyyy-MM");
+  }
+
   const filas = await getRowsConIndice(HOJAS.gasto);
-  return filas
-    .filter(({ row }) => row[0]?.startsWith(mesISO))
-    .reduce((acc, { row }) => acc + Number(row[1] || 0), 0);
+  const enRango = filas
+    .map(({ row }) => ({ ...rowAGasto(row) }))
+    .filter((g) => g.fecha && g.fecha >= desde && g.fecha <= hasta);
+
+  const acumular = (mapa, clave, monto) => {
+    const k = (clave || "").trim() || "sin especificar";
+    mapa[k] = (mapa[k] || 0) + monto;
+  };
+
+  let total = 0;
+  const porCategoria = {};
+  const porTipoPago = {};
+  const porMedioPago = {};
+
+  for (const g of enRango) {
+    total += g.monto;
+    acumular(porCategoria, g.categoria, g.monto);
+    acumular(porTipoPago, g.tipo_pago, g.monto);
+    if (g.tipo_pago && g.tipo_pago !== "Efectivo") acumular(porMedioPago, g.medio_pago, g.monto);
+  }
+
+  // Detalle ordenado del más viejo al más nuevo, para que quede prolijo en WhatsApp.
+  enRango.sort((a, b) => a.fecha.localeCompare(b.fecha));
+
+  return {
+    ok: true,
+    periodo,
+    desde,
+    hasta,
+    total,
+    cantidad_gastos: enRango.length,
+    por_categoria: porCategoria,
+    por_tipo_pago: porTipoPago,
+    por_medio_pago: porMedioPago,
+    detalle: enRango,
+  };
+}
+
+function rowAGasto(row) {
+  const [fechaRaw, montoStr, categoria, concepto, tipoPago, medioPago] = row;
+  return {
+    fecha: fechaCeldaAISO(fechaRaw),
+    monto: Number(montoStr || 0),
+    categoria: categoria || "sin categoría",
+    concepto: concepto || "",
+    tipo_pago: tipoPago || "",
+    medio_pago: medioPago || "",
+  };
 }
