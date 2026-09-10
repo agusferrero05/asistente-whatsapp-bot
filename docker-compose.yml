@@ -1,0 +1,70 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: evolution-postgres
+    restart: always
+    environment:
+      - POSTGRES_USER=evolution
+      - POSTGRES_PASSWORD=evolution
+      - POSTGRES_DB=evolution
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - bot-network
+
+  # Evolution API v2 requiere Postgres (ya no soporta almacenamiento "local").
+  # La imagen "local/evolution-api:latest" es la que compilaste vos mismo desde
+  # el código fuente (git clone + docker build), porque los tags públicos de
+  # Docker Hub/GHCR pueden no estar disponibles. Si en el futuro un tag público
+  # vuelve a funcionar (ej. evolutionapi/evolution-api:latest), podés
+  # reemplazar esta línea directamente por ese tag.
+  evolution-api:
+    image: local/evolution-api:latest
+    container_name: evolution-api
+    restart: always
+    depends_on:
+      - postgres
+    ports:
+      - "8080:8080"
+    environment:
+      - AUTHENTICATION_API_KEY=${EVOLUTION_API_KEY}
+      - DATABASE_ENABLED=true
+      - DATABASE_PROVIDER=postgresql
+      - DATABASE_CONNECTION_URI=postgresql://evolution:evolution@postgres:5432/evolution
+      - DATABASE_SAVE_DATA_INSTANCE=true
+      - DATABASE_SAVE_DATA_NEW_MESSAGE=true
+      - DATABASE_SAVE_MESSAGE_UPDATE=true
+      - DATABASE_SAVE_DATA_CONTACTS=true
+      - DATABASE_SAVE_DATA_CHATS=true
+      - CACHE_REDIS_ENABLED=false
+      - CACHE_LOCAL_ENABLED=true
+      - LOG_LEVEL=ERROR
+    volumes:
+      - evolution_instances:/evolution/instances
+    networks:
+      - bot-network
+
+  bot:
+    build: .
+    container_name: whatsapp-bot
+    restart: always
+    depends_on:
+      - evolution-api
+    env_file:
+      - .env
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+    networks:
+      - bot-network
+
+networks:
+  bot-network:
+    driver: bridge
+
+volumes:
+  evolution_instances:
+  postgres_data:
