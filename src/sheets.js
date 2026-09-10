@@ -5,11 +5,30 @@ const sheets = google.sheets({ version: "v4", auth: getOAuthClient() });
 const SHEET_ID = process.env.GOOGLE_SHEET_ID;
 
 // Pestañas esperadas en tu Google Sheet. Headers en fila 1:
-// Gastos:  Fecha | Monto | Categoria | Concepto
+// Gastos:  Fecha | Monto | Categoria | Concepto | Tipo de pago | Medio de pago
+//          - Tipo de pago: Efectivo / Débito / Transferencia (default: Débito)
+//          - Medio de pago: Naranja X, Uala, Mercado Pago, Brubank, etc.
+//            (default: Naranja X cuando el tipo de pago es Débito o
+//            Transferencia; vacío cuando es Efectivo)
 // Deudas:  Fecha | Monto | Concepto  | Estado (pendiente/saldado)
 // Cobros:  Fecha | Monto | Concepto  | Estado (pendiente/cobrado)
 // Notas:   Fecha | Categoria | Item  | Estado (pendiente/completado/archivado)
+//
+// IMPORTANTE: si tu pestaña "Gastos" todavía no tiene las columnas E y F,
+// agregá manualmente en la fila 1 los headers "Tipo de pago" (E1) y
+// "Medio de pago" (F1) antes de usar esta versión.
 const HOJAS = { gasto: "Gastos", deuda: "Deudas", cobro: "Cobros", nota: "Notas" };
+
+// Tipos de pago válidos que puede mandar el agente, normalizados a un
+// texto prolijo para la planilla.
+const TIPOS_PAGO_VALIDOS = {
+  efectivo: "Efectivo",
+  debito: "Débito",
+  débito: "Débito",
+  transferencia: "Transferencia",
+};
+const TIPO_PAGO_DEFAULT = "Débito";
+const MEDIO_PAGO_DEFAULT = "Naranja X";
 
 let sheetIdCache = null; // { "Gastos": 0, "Deudas": 123456, ... }
 
@@ -34,7 +53,10 @@ async function appendRow(hoja, values) {
 
 /** Trae todas las filas de una pestaña (sin headers) con su número de fila real (1-indexed, incluye header). */
 async function getRowsConIndice(hoja) {
-  const { data } = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${hoja}!A2:D` });
+  // A2:F cubre de sobra tanto Gastos (6 columnas, con tipo/medio de pago)
+  // como las pestañas más angostas (Deudas/Cobros/Notas, 4 columnas) — las
+  // columnas E y F simplemente vienen vacías/undefined para esas otras.
+  const { data } = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${hoja}!A2:F` });
   return (data.values || []).map((row, i) => ({ filaIndex: i + 2, row })); // +2: fila 1 es header, A2 es index 0
 }
 
@@ -68,10 +90,31 @@ async function actualizarCelda(hoja, filaIndex, columnaLetra, valor) {
 // GASTOS
 // ---------------------------------------------------------------------------
 
-export async function registrarGasto({ monto, categoria, concepto }) {
+export async function registrarGasto({ monto, categoria, concepto, tipo_pago, medio_pago }) {
   const fecha = new Date().toISOString().slice(0, 10);
-  await appendRow(HOJAS.gasto, [fecha, monto, categoria || "sin categoría", concepto || ""]);
-  return { ok: true, fecha, monto, categoria: categoria || "sin categoría", concepto: concepto || "" };
+
+  const tipoPagoNormalizado = TIPOS_PAGO_VALIDOS[(tipo_pago || "").trim().toLowerCase()] || TIPO_PAGO_DEFAULT;
+  const esEfectivo = tipoPagoNormalizado === "Efectivo";
+  const medioPagoFinal = esEfectivo ? "" : (medio_pago || "").trim() || MEDIO_PAGO_DEFAULT;
+
+  await appendRow(HOJAS.gasto, [
+    fecha,
+    monto,
+    categoria || "sin categoría",
+    concepto || "",
+    tipoPagoNormalizado,
+    medioPagoFinal,
+  ]);
+
+  return {
+    ok: true,
+    fecha,
+    monto,
+    categoria: categoria || "sin categoría",
+    concepto: concepto || "",
+    tipo_pago: tipoPagoNormalizado,
+    medio_pago: medioPagoFinal || null,
+  };
 }
 
 /** Borra la última fila cargada en Gastos y devuelve qué se borró. */
@@ -81,8 +124,8 @@ export async function deshacerUltimoGasto() {
 
   const ultima = filas[filas.length - 1];
   await borrarFila(HOJAS.gasto, ultima.filaIndex);
-  const [fecha, monto, categoria, concepto] = ultima.row;
-  return { ok: true, eliminado: { fecha, monto, categoria, concepto } };
+  const [fecha, monto, categoria, concepto, tipo_pago, medio_pago] = ultima.row;
+  return { ok: true, eliminado: { fecha, monto, categoria, concepto, tipo_pago, medio_pago } };
 }
 
 // ---------------------------------------------------------------------------

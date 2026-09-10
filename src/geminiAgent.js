@@ -81,7 +81,10 @@ Reglas operativas obligatorias:
    - Para eliminar un evento, usá eliminar_evento con criterio_busqueda. Si la herramienta devuelve { ambiguo: true, candidatos: [...] }, NO seguiste eliminando nada todavía: mostrale al usuario los candidatos (título y horario de cada uno) y preguntale cuál quiere borrar. Una vez que el usuario elige, volvé a llamar a eliminar_evento pasando el event_id de ese candidato. Nunca asumas cuál de varios candidatos es "el correcto" sin preguntar.
 
 2. Finanzas (Sheets):
-   - Registrar gastos: usá registrar_gasto con monto, categoría y concepto.
+   - Registrar gastos: usá registrar_gasto con monto, categoría y concepto. Además, fijate si el usuario menciona CÓMO pagó:
+     * tipo_pago: "efectivo", "debito" o "transferencia", según lo que diga (ej. "pagué en efectivo" → efectivo; "con la tarjeta", "débito" → debito; "transferí", "por transferencia" → transferencia).
+     * medio_pago: el nombre de la cuenta/tarjeta virtual si lo menciona (ej. Naranja X, Uala, Mercado Pago, Brubank, Personal Pay, etc.), solo aplica cuando el pago es débito o transferencia.
+     Si el usuario NO aclara el tipo de pago, NO se lo preguntes ni asumas nada vos: simplemente no incluyas tipo_pago ni medio_pago en la llamada — el sistema ya aplica el default (débito en Naranja X) automáticamente. Si dice "efectivo" y nada más, mandá solo tipo_pago: "efectivo" sin medio_pago.
    - Deshacer gastos erróneos: si el usuario pide anular, deshacer o borrar el último gasto, usá deshacer_ultimo_gasto.
    - Deudas y Cobros: 'deuda' es lo que el usuario debe a otros; 'cobro' es lo que le deben al usuario. Para asentar usá registrar_deuda_cobro. Cuando se salde, usá saldar_cuenta.
 
@@ -156,13 +159,25 @@ const toolDeclarations = [
   },
   {
     name: "registrar_gasto",
-    description: "Registra un gasto en Google Sheets.",
+    description:
+      "Registra un gasto en Google Sheets, incluyendo cómo se pagó. Si el usuario no aclara tipo_pago ni medio_pago, no los incluyas: el sistema aplica el default (débito en Naranja X) automáticamente, no hace falta preguntar.",
     parameters: {
       type: "OBJECT",
       properties: {
         monto: { type: "NUMBER", description: "Monto numérico gastado." },
         categoria: { type: "STRING", description: "Categoría (comida, súper, transporte, etc.)." },
         concepto: { type: "STRING", description: "Detalle opcional del gasto." },
+        tipo_pago: {
+          type: "STRING",
+          description:
+            "Cómo se pagó, SOLO si el usuario lo menciona explícitamente. Si no dice nada, omitir este campo (el default es débito).",
+          enum: ["efectivo", "debito", "transferencia"],
+        },
+        medio_pago: {
+          type: "STRING",
+          description:
+            "Cuenta o tarjeta virtual usada (ej. 'Naranja X', 'Uala', 'Mercado Pago', 'Brubank'), SOLO si el usuario la menciona y el pago fue débito o transferencia. Si no la menciona, omitir este campo (el default es Naranja X).",
+        },
       },
       required: ["monto", "categoria"],
     },
