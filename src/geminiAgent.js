@@ -309,10 +309,50 @@ const toolHandlers = {
   limpiar_notas: sheetsTools.limpiarNotas,
 };
 
+// Un turno "user" que es texto del usuario (no una functionResponse). Es el
+// único tipo de turno desde el que se puede arrancar un historial recortado.
+function esTurnoUsuarioDeTexto(contenido) {
+  return (
+    contenido?.role === "user" &&
+    Array.isArray(contenido.parts) &&
+    contenido.parts.some((p) => typeof p.text === "string") &&
+    !contenido.parts.some((p) => p.functionResponse)
+  );
+}
+
+// Recorta el historial a ~MAX_TURNOS_HISTORIAL intercambios SIN partir un par
+// functionCall/functionResponse: el recorte siempre arranca en un mensaje de
+// texto del usuario. Antes se cortaba por posición con slice(-N), lo que podía
+// dejar el historial empezando por una functionResponse huérfana; Gemini
+// respondía entonces 400 "function response turn comes immediately after a
+// function call turn" en TODOS los mensajes siguientes, hasta el próximo reinicio.
 function recortarHistorial(historial) {
   if (!Array.isArray(historial)) return [];
-  if (historial.length <= MAX_TURNOS_HISTORIAL * 2) return historial;
-  return historial.slice(-MAX_TURNOS_HISTORIAL * 2);
+  const max = MAX_TURNOS_HISTORIAL * 2;
+  if (historial.length <= max) return historial;
+
+  let inicio = historial.length - max;
+  while (inicio < historial.length && !esTurnoUsuarioDeTexto(historial[inicio])) inicio++;
+  return historial.slice(inicio);
+}
+
+// Detecta el 400 de Gemini por orden inválido de turnos function call/response.
+function esErrorDeHistorial(err) {
+  const msg = err?.message || "";
+  return /function (call|response) turn/i.test(msg) && (err?.status === 400 || msg.includes("400"));
+}
+
+// Resumen compacto de los primeros turnos, solo para el log de diagnóstico.
+function resumirHistorial(historial, max = 4) {
+  return historial
+    .slice(0, max)
+    .map((c) => {
+      const tipos = (c.parts || []).map((p) =>
+        p.functionCall ? `fc:${p.functionCall.name}` : p.functionResponse ? `fr:${p.functionResponse.name}` : typeof p.text === "string" ? "texto" : "otro"
+      );
+      return `${c.role}[${tipos.join(",")}]`;
+    })
+    .join(" > ");
 }
 
 async function ejecutarConReintento(params, maxIntentos = 3) {
@@ -334,8 +374,7 @@ async function ejecutarConReintento(params, maxIntentos = 3) {
 }
 
 // Cola por número: evita que dos mensajes del MISMO usuario se procesen en
-// paralelo y corrompan el array de historial compartido (causa del error
-// "function response turn comes immediately after a function call turn").
+// paralelo y mezclen turnos en el historial compartido.
 // Mensajes de números distintos siguen procesándose sin bloquearse entre sí.
 const colasPorNumero = new Map();
 
@@ -347,14 +386,34 @@ export function procesarMensajeConAgente(numero, texto) {
 }
 
 async function procesarMensajeInterno(numero, texto) {
-  let contents = historiales.get(numero) || [];
+  const historialPrevio = historiales.get(numero) || [];
+  try {
+    return await ejecutarTurno(numero, texto, historialPrevio);
+  } catch (err) {
+    // Red de seguridad: si Gemini rechaza el historial guardado por orden de
+    // turnos y todavía no se ejecutó ninguna herramienta en este mensaje (para
+    // no duplicar gastos/eventos), se descarta el historial de este número y se
+    // reintenta una vez desde cero. Así un historial inconsistente nunca más
+    // deja al bot trabado hasta el próximo reinicio.
+    if (esErrorDeHistorial(err) && !err.ejecutoHerramientas) {
+      console.warn(
+        `♻️ Historial inconsistente (${historialPrevio.length} turnos; arranca: ${resumirHistorial(historialPrevio)}). Se descarta y se reintenta sin historial.`
+      );
+      historiales.delete(numero);
+      return await ejecutarTurno(numero, texto, []);
+    }
+    throw err;
+  }
+}
 
-  contents.push({
-    role: "user",
-    parts: [{ text: texto }],
-  });
+async function ejecutarTurno(numero, texto, historialPrevio) {
+  // Se trabaja sobre una COPIA: el historial guardado solo se reemplaza al
+  // final, y solo si el turno terminó bien. Antes se mutaba el array guardado,
+  // así que una excepción a mitad de camino lo dejaba con turnos sueltos.
+  const contents = [...historialPrevio, { role: "user", parts: [{ text: texto }] }];
 
   let respuestaFinal = "";
+  let ejecutoHerramientas = false;
 
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
     let response;
@@ -372,12 +431,13 @@ async function procesarMensajeInterno(numero, texto) {
         respuestaFinal = "Se me acabó el cupo gratuito de IA por hoy 😅. Volvé a escribirme después de medianoche (hora Argentina) y sigo funcionando normal. Mientras tanto seguí anotando lo que necesites, lo proceso cuando vuelva el cupo.";
         break;
       }
+      if (err && typeof err === "object") err.ejecutoHerramientas = ejecutoHerramientas;
       throw err;
     }
 
-    const candidate = response.candidates?.[0];
-    const candidateContent = candidate?.content;
-    if (!candidateContent) break;
+    const candidateContent = response.candidates?.[0]?.content;
+    // Un turno del modelo sin partes dejaría el historial inválido para siempre.
+    if (!candidateContent?.parts?.length) break;
 
     contents.push(candidateContent);
 
@@ -387,6 +447,7 @@ async function procesarMensajeInterno(numero, texto) {
       break;
     }
 
+    ejecutoHerramientas = true;
     const responseParts = [];
     for (const call of calls) {
       let resultado;
@@ -411,6 +472,20 @@ async function procesarMensajeInterno(numero, texto) {
       role: "user",
       parts: responseParts,
     });
+  }
+
+  // El historial solo se guarda si termina en un turno final del modelo (sin
+  // functionCall pendiente). Si el bucle cortó antes (tope de iteraciones, cupo
+  // agotado, respuesta vacía) y ya se ejecutaron herramientas, se cierra con un
+  // turno del modelo para que el historial quede válido; si no se ejecutó nada,
+  // el turno se descarta entero.
+  const ultimo = contents[contents.length - 1];
+  const terminoBien = ultimo && ultimo.role !== "user" && !ultimo.parts?.some((p) => p.functionCall);
+  if (!terminoBien) {
+    if (!ejecutoHerramientas) {
+      return respuestaFinal || "No pude procesar ese mensaje, probá de nuevo.";
+    }
+    contents.push({ role: "model", parts: [{ text: respuestaFinal || "Listo." }] });
   }
 
   historiales.set(numero, recortarHistorial(contents));
